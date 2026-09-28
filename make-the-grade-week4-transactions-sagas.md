@@ -13,7 +13,7 @@ flowchart LR
   Grading[Grading Service<br/>MC/TF auto grade<br/>short answer pending if needed]
   GradeStore[(Grading Result Store<br/>+ outbox)]
   Consolidation[Result Consolidation Service<br/>bounded DB writers]
-  FinalDB[(Relational Test Answer DB<br/>300 connections max)]
+  FinalDB[(Relational Test Answer DB<br/>300 connections max, 250 connection constraint)]
   Reconcile[Lifecycle State + Reconciliation]
   Reporting[Reporting Service]
 
@@ -49,7 +49,7 @@ Result Consolidation may write a pending-grade row as soon as it receives `Answe
 | Get next question | Synchronous | Orchestrated by Student Testing Service | The test is timed and forward-only, so question delivery must be fast and deterministic. |
 | Submit answer and advance | Synchronous until durable acceptance | Student Testing coordinates with Answer Intake | The student should advance only after the answer is durably recorded. This is the key "no lost answers" checkpoint. |
 | Grade accepted answer | Asynchronous | Choreographed event consumer with lifecycle tracking | Grading does not need to block the student, and short answers may not be immediately graded. |
-| Consolidate final result | Asynchronous | Orchestrated by Result Consolidation / Reconciliation | Final DB writes must be throttled because the relational database has a 300-connection maximum. |
+| Consolidate final result | Asynchronous | Orchestrated by Result Consolidation / Reconciliation | Final DB writes must be throttled because the relational database has a 300-connection maximum and a 250 connection constraint. |
 | Generate reports | Synchronous request, asynchronous/report job if large | Reporting reads reconciled results | Reports happen after testing and should not interfere with the student test path. |
 
 Recommended pattern: a Parallel Saga style for the answer lifecycle: asynchronous communication, eventual consistency, and an explicit lifecycle state owner. This gives the scale of async processing while keeping a reliable answer status that can be queried and repaired.
@@ -58,7 +58,7 @@ Rejected communication choices:
 
 | Rejected choice | Why rejected |
 | --- | --- |
-| Fully synchronous answer -> grade -> consolidate before next question | Too slow for timed tests and risky against the 300-connection database limit. |
+| Fully synchronous answer -> grade -> consolidate before next question | Too slow for timed tests and risky against the 250-connection database constraint. |
 | Pure choreography with no lifecycle state owner | Scales well, but makes it too hard to answer "where is this student's answer?" during failures. |
 | Two-phase commit across intake, grading, and final DB | Too much coupling and too fragile at 200000 concurrent students. |
 | Student clients writing directly to final answer DB | Unsafe for security, connection limits, and answer integrity. |
@@ -72,7 +72,7 @@ Core rule: an accepted answer is never deleted or compensated away. Failures are
 | Answer acceptance | Insert accepted answer, record received timestamp, enforce idempotency key, write outbox event | Strong local consistency | Unique key: `test_session_id + student_id + question_id`. This prevents duplicate answers if the browser retries. |
 | Session advancement | Advance to next question only after acceptance ACK | Strong workflow rule | If session state is in the same store, update it in the same transaction. If not, session advancement is idempotent and based on accepted answer id. |
 | Grading | Read accepted answer and protected answer key version; write grade result or pending short-answer state | Eventual consistency | Answer keys stay inside the grading boundary. Events carry answer id and key version, not the answer key. |
-| Result consolidation | Upsert accepted answer as pending grade, then update grade/completion status when available | Eventual consistency with idempotent writes | Consolidation workers use a bounded connection pool so total DB connections never exceed 300. |
+| Result consolidation | Upsert accepted answer as pending grade, then update grade/completion status when available | Eventual consistency with idempotent writes | Consolidation workers use a bounded connection pool so total DB connections never exceed 250. |
 | Reconciliation | Compare accepted, graded, and consolidated counts; replay missing events | Eventual repair | The accepted answer store is the durable source for rebuilding downstream state. |
 | Reporting readiness | Mark reports ready only after reconciliation thresholds pass | Read consistency after testing | Students do not need immediate results, so reports can wait for complete consolidation. |
 
@@ -104,6 +104,24 @@ stateDiagram-v2
   Reconciled --> [*]
   RejectedExpired --> [*]
   DuplicateIgnored --> [*]
+```
+
+```mermaid
+stateDiagram-v2
+    PendingManualOrRubricGrade
+    LLMGrader --> ScoreConfidence: Grade and Confidence Score
+    PendingManualOrRubricGrade --> LLMGrader: Multiple Choice Answer
+    ScoreConfidence --> GradingFailed/ReviewRequired: Low Confidence X < 85%
+    ScoreConfidence --> RandomRoll: High Confidence X > 85%
+    GradingFailed/ReviewRequired --> NeedsReview
+    RandomRoll --> Audit: Roll < X%
+    RandomRoll --> AutoApprove: Roll > X%
+    Audit --> GradingFailed/ReviewRequired
+    
+    PendingManualOrRubricGrade --> MultipleChoice
+    MultipleChoice --> NeedsReview: Reviewer Exception
+    MultipleChoice --> Graded: Grade Completed
+    NeedsReview --> Graded: Corrected/Reviewed
 ```
 
 ## 4. Failure Scenarios
@@ -141,6 +159,6 @@ stateDiagram-v2
 | Outbox health | No unpublished accepted-answer events beyond SLA |
 | Grading lag | MC/TF graded within operational SLA; short answers tracked separately |
 | Consolidation lag | All accepted answers eventually reach final DB or explicit review state |
-| Final DB protection | Connection pool stays at or below 300 connections |
+| Final DB protection | Connection pool stays at or below 250 connections |
 | Reconciliation | Accepted count = consolidated count + explicit terminal exception count before reports |
 | Security | No answer key or correct-answer payload leaves the grading boundary |
